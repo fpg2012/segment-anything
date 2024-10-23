@@ -82,6 +82,7 @@ class ImageEncoderViT(nn.Module):
                 rel_pos_zero_init=rel_pos_zero_init,
                 window_size=window_size if i not in global_attn_indexes else 0,
                 input_size=(img_size // patch_size, img_size // patch_size),
+                name=f'block-{i}'
             )
             self.blocks.append(block)
 
@@ -104,7 +105,9 @@ class ImageEncoderViT(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        print(x.shape)
         x = self.patch_embed(x)
+        print(x.shape)
         if self.pos_embed is not None:
             x = x + self.pos_embed
 
@@ -131,6 +134,7 @@ class Block(nn.Module):
         rel_pos_zero_init: bool = True,
         window_size: int = 0,
         input_size: Optional[Tuple[int, int]] = None,
+        name = None
     ) -> None:
         """
         Args:
@@ -148,6 +152,7 @@ class Block(nn.Module):
                 positional parameter size.
         """
         super().__init__()
+        self.name = name
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
             dim,
@@ -156,6 +161,7 @@ class Block(nn.Module):
             use_rel_pos=use_rel_pos,
             rel_pos_zero_init=rel_pos_zero_init,
             input_size=input_size if window_size == 0 else (window_size, window_size),
+            name=f'attn-{self.name}',
         )
 
         self.norm2 = norm_layer(dim)
@@ -193,6 +199,7 @@ class Attention(nn.Module):
         use_rel_pos: bool = False,
         rel_pos_zero_init: bool = True,
         input_size: Optional[Tuple[int, int]] = None,
+        name = None
     ) -> None:
         """
         Args:
@@ -213,6 +220,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
 
         self.use_rel_pos = use_rel_pos
+        self.name = name
         if self.use_rel_pos:
             assert (
                 input_size is not None
@@ -222,6 +230,7 @@ class Attention(nn.Module):
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        print(f'{self.name}: input {x.shape}, heads: {self.num_heads}')
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
         qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
@@ -234,6 +243,8 @@ class Attention(nn.Module):
             attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
 
         attn = attn.softmax(dim=-1)
+        torch.save(attn, f'temp/{self.name}.pt')
+        
         x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         x = self.proj(x)
 
