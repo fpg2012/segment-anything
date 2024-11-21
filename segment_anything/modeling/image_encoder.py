@@ -54,6 +54,7 @@ class ImageEncoderViT(nn.Module):
         """
         super().__init__()
         self.img_size = img_size
+        self.attention_saves = {}
 
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),
@@ -82,7 +83,9 @@ class ImageEncoderViT(nn.Module):
                 rel_pos_zero_init=rel_pos_zero_init,
                 window_size=window_size if i not in global_attn_indexes else 0,
                 input_size=(img_size // patch_size, img_size // patch_size),
-                name=f'block-{i}'
+                name=f'block-{i}',
+                save=(i in global_attn_indexes),
+                attention_saves=self.attention_saves
             )
             self.blocks.append(block)
 
@@ -104,10 +107,11 @@ class ImageEncoderViT(nn.Module):
             LayerNorm2d(out_chans),
         )
 
+    def clear_attention_saves(self):
+        self.attention_saves.clear()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        print(x.shape)
         x = self.patch_embed(x)
-        print(x.shape)
         if self.pos_embed is not None:
             x = x + self.pos_embed
 
@@ -115,7 +119,7 @@ class ImageEncoderViT(nn.Module):
             x = blk(x)
 
         x = self.neck(x.permute(0, 3, 1, 2))
-
+        
         return x
 
 
@@ -134,7 +138,9 @@ class Block(nn.Module):
         rel_pos_zero_init: bool = True,
         window_size: int = 0,
         input_size: Optional[Tuple[int, int]] = None,
-        name = None
+        name = None,
+        save = False,
+        attention_saves = None
     ) -> None:
         """
         Args:
@@ -154,6 +160,8 @@ class Block(nn.Module):
         super().__init__()
         self.name = name
         self.norm1 = norm_layer(dim)
+        self.save = save
+        self.attention_saves = attention_saves
         self.attn = Attention(
             dim,
             num_heads=num_heads,
@@ -162,6 +170,8 @@ class Block(nn.Module):
             rel_pos_zero_init=rel_pos_zero_init,
             input_size=input_size if window_size == 0 else (window_size, window_size),
             name=f'attn-{self.name}',
+            save=self.save,
+            attention_saves=self.attention_saves
         )
 
         self.norm2 = norm_layer(dim)
@@ -199,7 +209,9 @@ class Attention(nn.Module):
         use_rel_pos: bool = False,
         rel_pos_zero_init: bool = True,
         input_size: Optional[Tuple[int, int]] = None,
-        name = None
+        name = None,
+        save = False,
+        attention_saves = None,
     ) -> None:
         """
         Args:
@@ -221,6 +233,8 @@ class Attention(nn.Module):
 
         self.use_rel_pos = use_rel_pos
         self.name = name
+        self.save = save
+        self.attention_saves = attention_saves
         if self.use_rel_pos:
             assert (
                 input_size is not None
@@ -230,7 +244,6 @@ class Attention(nn.Module):
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        print(f'{self.name}: input {x.shape}, heads: {self.num_heads}')
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
         qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
@@ -243,7 +256,11 @@ class Attention(nn.Module):
             attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
 
         attn = attn.softmax(dim=-1)
-        torch.save(attn, f'temp/{self.name}.pt')
+        
+        if self.save:
+            assert(self.attention_saves is not None)
+            # torch.save(attn, f'temp/{self.name}.pt')
+            self.attention_saves[self.name] = attn
         
         x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         x = self.proj(x)
@@ -364,6 +381,10 @@ def add_decomposed_rel_pos(
     r_q = q.reshape(B, q_h, q_w, dim)
     rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
     rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+
+    print('rel_h[:, :, :, :, None]: ', rel_h[:, :, :, :, None].shape)
+    print('rel_w[:, :, :, None, :]: ', rel_w[:, :, :, None, :].shape)
+    print('attn: ', attn.shape)
 
     attn = (
         attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]
