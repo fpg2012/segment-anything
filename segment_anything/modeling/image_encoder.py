@@ -33,6 +33,9 @@ class ImageEncoderViT(nn.Module):
         rel_pos_zero_init: bool = True,
         window_size: int = 0,
         global_attn_indexes: Tuple[int, ...] = (),
+        save_attention: bool = False,
+        global_attn_div: int = 1,
+        window_attn_div: int = 1,
     ) -> None:
         """
         Args:
@@ -84,8 +87,9 @@ class ImageEncoderViT(nn.Module):
                 window_size=window_size if i not in global_attn_indexes else 0,
                 input_size=(img_size // patch_size, img_size // patch_size),
                 name=f'block-{i}',
-                save=(i in global_attn_indexes),
-                attention_saves=self.attention_saves
+                save=False if not save_attention else (i in global_attn_indexes),
+                attention_saves=self.attention_saves,
+                div=window_attn_div if i not in global_attn_indexes else global_attn_div
             )
             self.blocks.append(block)
 
@@ -140,7 +144,8 @@ class Block(nn.Module):
         input_size: Optional[Tuple[int, int]] = None,
         name = None,
         save = False,
-        attention_saves = None
+        attention_saves = None,
+        div=1,
     ) -> None:
         """
         Args:
@@ -171,7 +176,8 @@ class Block(nn.Module):
             input_size=input_size if window_size == 0 else (window_size, window_size),
             name=f'attn-{self.name}',
             save=self.save,
-            attention_saves=self.attention_saves
+            attention_saves=self.attention_saves,
+            div=div,
         )
 
         self.norm2 = norm_layer(dim)
@@ -212,6 +218,7 @@ class Attention(nn.Module):
         name = None,
         save = False,
         attention_saves = None,
+        div=1,
     ) -> None:
         """
         Args:
@@ -235,6 +242,7 @@ class Attention(nn.Module):
         self.name = name
         self.save = save
         self.attention_saves = attention_saves
+        self.div = div
         if self.use_rel_pos:
             assert (
                 input_size is not None
@@ -243,6 +251,37 @@ class Attention(nn.Module):
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
 
+    def blocked_attention(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, div=4):
+        """
+        note: 
+          1. Q and K should be in the same shape
+          2. H and H must be divisable by `div`
+          3. Q, K, V must on the same device
+        """
+        B, H, W, C = Q.shape
+        assert(H//div * div == H and W//div * div == W)
+        if self.use_rel_pos:
+            Rh = get_rel_pos(H, H, self.rel_pos_h).view(div, H//div, div, H//div, C).permute(0, 2, 1, 3, 4)
+            Rw = get_rel_pos(W, W, self.rel_pos_w).view(W, W, C)
+
+        Q = Q.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
+        K = K.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
+        V = V.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
+
+        s = torch.zeros((B, H, W), dtype=torch.float32, device=Q.device)
+        x = torch.zeros((B, H, W, C), dtype=torch.float32, device=Q.device)
+        for i in range(div):
+            for p in range(div):
+                t = torch.einsum('bijc,bpqc->bijpq', Q[i], K[p])
+                if self.use_rel_pos:
+                    t += torch.einsum('bijc,ipc->bijp', Q[i], Rh[i, p]).view(B, H//div, W, H//div, 1)
+                    t += torch.einsum('bijc,jqc->bijq', Q[i], Rw).view(B, H//div, W, 1, W)
+                t = torch.exp(t)
+                s[:, i*(H//div):(i+1)*(H//div), :] += torch.sum(t, dim=(3, 4))
+                x[:, i*(H//div):(i+1)*(H//div), :, :] += torch.einsum('bijpq,bpqc->bijc', t, V[p])
+        x /= s.view((B, H, W, 1))
+        return x
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
@@ -250,19 +289,23 @@ class Attention(nn.Module):
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
-        attn = (q * self.scale) @ k.transpose(-2, -1)
+        if self.div == 1:
+            print('no division')
+            attn = (q * self.scale) @ k.transpose(-2, -1)
 
-        if self.use_rel_pos:
-            attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            if self.use_rel_pos:
+                attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
 
-        attn = attn.softmax(dim=-1)
+            attn = attn.softmax(dim=-1)
         
-        if self.save:
-            assert(self.attention_saves is not None)
-            # torch.save(attn, f'temp/{self.name}.pt')
-            self.attention_saves[self.name] = attn
+            x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+        else:
+            q = q.view(B * self.num_heads, H, W, -1)
+            k = q.view(B * self.num_heads, H, W, -1)
+            v = q.view(B * self.num_heads, H, W, -1)
+            x = self.blocked_attention(q, k, v, div=self.div)
+            x = x.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         
-        x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         x = self.proj(x)
 
         return x
@@ -381,10 +424,6 @@ def add_decomposed_rel_pos(
     r_q = q.reshape(B, q_h, q_w, dim)
     rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
     rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
-
-    print('rel_h[:, :, :, :, None]: ', rel_h[:, :, :, :, None].shape)
-    print('rel_w[:, :, :, None, :]: ', rel_w[:, :, :, None, :].shape)
-    print('attn: ', attn.shape)
 
     attn = (
         attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]

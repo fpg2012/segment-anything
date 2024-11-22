@@ -10,6 +10,11 @@ from segment_anything.modeling import ImageEncoderViT
 from functools import partial
 import gc
 
+from segment_anything.modeling.mask_decoder import MaskDecoder
+from segment_anything.modeling.prompt_encoder import PromptEncoder
+from segment_anything.modeling.sam import Sam
+from segment_anything.modeling.transformer import TwoWayTransformer
+
 class COCOMValDataset(Dataset):
     
     def __init__(self, dataset_dir, transform, image_size=1024, num_images=100):
@@ -129,3 +134,136 @@ def build_encoder_only(
                 filtered_state_dict[key.removeprefix('image_encoder.')] = state_dict[key]
         image_encoder.load_state_dict(filtered_state_dict)
     return image_encoder
+
+def build_encoder_only_with_extrapolation(
+    encoder_embed_dim,
+    encoder_depth,
+    encoder_num_heads,
+    encoder_global_attn_indexes,
+    image_size=None,
+    checkpoint=None,
+):
+    """
+    note: windows_size is not enlarged
+    """
+    prompt_embed_dim = 256
+    image_size = 1024 if image_size is None else image_size
+    vit_patch_size = 16
+    image_embedding_size = image_size // vit_patch_size
+    image_encoder=ImageEncoderViT(
+            depth=encoder_depth,
+            embed_dim=encoder_embed_dim,
+            img_size=image_size,
+            mlp_ratio=4,
+            norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+            num_heads=encoder_num_heads,
+            patch_size=vit_patch_size,
+            qkv_bias=True,
+            use_rel_pos=True,
+            global_attn_indexes=encoder_global_attn_indexes,
+            window_size=14,
+            out_chans=prompt_embed_dim,
+        )
+    image_encoder.eval()
+    if checkpoint is not None:
+        with open(checkpoint, "rb") as f:
+            state_dict = torch.load(f)
+        filtered_state_dict = {}
+        for key in state_dict.keys():
+            if key.startswith('image_encoder.'):
+                new_key = key.removeprefix('image_encoder.')
+                if new_key.endswith('pos_embed'):
+                    param = state_dict[key].permute(0, 3, 1, 2)
+                    param = F.interpolate(param, size=(128, 128), align_corners=True, mode='bilinear')
+                    param = param.permute(0, 2, 3, 1)
+                    filtered_state_dict[new_key] = param
+                elif new_key.endswith('.7.attn.rel_pos_h') or new_key.endswith('.7.attn.rel_pos_w') \
+                     or new_key.endswith('.15.attn.rel_pos_h') or new_key.endswith('.15.attn.rel_pos_w') \
+                     or new_key.endswith('.23.attn.rel_pos_h') or new_key.endswith('.23.attn.rel_pos_w') \
+                     or new_key.endswith('.31.attn.rel_pos_h') or new_key.endswith('.31.attn.rel_pos_w'):
+                    param = state_dict[key].unsqueeze(0).unsqueeze(0)
+                    param = F.interpolate(param, size=(255, 80), align_corners=True, mode='bilinear')
+                    param = param.squeeze(0).squeeze(0)
+                    filtered_state_dict[new_key] = param
+                else:
+                    filtered_state_dict[new_key] = state_dict[key]
+        image_encoder.load_state_dict(filtered_state_dict)
+    return image_encoder
+
+def build_sam_with_extrapolation(
+    encoder_embed_dim,
+    encoder_depth,
+    encoder_num_heads,
+    encoder_global_attn_indexes,
+    checkpoint=None,
+):
+    prompt_embed_dim = 256
+    image_size = 2048
+    vit_patch_size = 16
+    image_embedding_size = image_size // vit_patch_size
+    sam = Sam(
+        image_encoder=ImageEncoderViT(
+            depth=encoder_depth,
+            embed_dim=encoder_embed_dim,
+            img_size=image_size,
+            mlp_ratio=4,
+            norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+            num_heads=encoder_num_heads,
+            patch_size=vit_patch_size,
+            qkv_bias=True,
+            use_rel_pos=True,
+            global_attn_indexes=encoder_global_attn_indexes,
+            window_size=14,
+            out_chans=prompt_embed_dim,
+            global_attn_div=4,
+            window_attn_div=1,
+        ),
+        prompt_encoder=PromptEncoder(
+            embed_dim=prompt_embed_dim,
+            image_embedding_size=(image_embedding_size, image_embedding_size),
+            input_image_size=(image_size, image_size),
+            mask_in_chans=16,
+        ),
+        mask_decoder=MaskDecoder(
+            num_multimask_outputs=3,
+            transformer=TwoWayTransformer(
+                depth=2,
+                embedding_dim=prompt_embed_dim,
+                mlp_dim=2048,
+                num_heads=8,
+            ),
+            transformer_dim=prompt_embed_dim,
+            iou_head_depth=3,
+            iou_head_hidden_dim=256,
+        ),
+        pixel_mean=[123.675, 116.28, 103.53],
+        pixel_std=[58.395, 57.12, 57.375],
+    )
+    sam.eval()
+    if checkpoint is not None:
+        with open(checkpoint, "rb") as f:
+            state_dict = torch.load(f)
+        filtered_state_dict = {}
+        for key in state_dict.keys():
+            if key.startswith('image_encoder.'):
+                new_key = key
+                if new_key.endswith('pos_embed'):
+                    param = state_dict[key].permute(0, 3, 1, 2)
+                    param = F.interpolate(param, size=(128, 128), align_corners=True, mode='bilinear')
+                    param = param.permute(0, 2, 3, 1)
+                    filtered_state_dict[new_key] = param
+                elif new_key.endswith('.7.attn.rel_pos_h') or new_key.endswith('.7.attn.rel_pos_w') \
+                     or new_key.endswith('.15.attn.rel_pos_h') or new_key.endswith('.15.attn.rel_pos_w') \
+                     or new_key.endswith('.23.attn.rel_pos_h') or new_key.endswith('.23.attn.rel_pos_w') \
+                     or new_key.endswith('.31.attn.rel_pos_h') or new_key.endswith('.31.attn.rel_pos_w'):
+                    param = state_dict[key].unsqueeze(0).unsqueeze(0)
+                    param = F.interpolate(param, size=(255, 80), align_corners=True, mode='bilinear')
+                    param = param.squeeze(0).squeeze(0)
+                    filtered_state_dict[new_key] = param
+                else:
+                    filtered_state_dict[key] = state_dict[key]
+            else:
+                filtered_state_dict[key] = state_dict[key]
+        sam.load_state_dict(filtered_state_dict)
+        #sam = ipex.optimize_transformers(sam)
+    return sam
