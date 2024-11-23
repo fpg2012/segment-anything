@@ -251,37 +251,6 @@ class Attention(nn.Module):
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
 
-    def blocked_attention(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, div=4):
-        """
-        note: 
-          1. Q and K should be in the same shape
-          2. H and H must be divisable by `div`
-          3. Q, K, V must on the same device
-        """
-        B, H, W, C = Q.shape
-        assert(H//div * div == H and W//div * div == W)
-        if self.use_rel_pos:
-            Rh = get_rel_pos(H, H, self.rel_pos_h).view(div, H//div, div, H//div, C).permute(0, 2, 1, 3, 4)
-            Rw = get_rel_pos(W, W, self.rel_pos_w).view(W, W, C)
-
-        Q = Q.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
-        K = K.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
-        V = V.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
-
-        s = torch.zeros((B, H, W), dtype=torch.float32, device=Q.device)
-        x = torch.zeros((B, H, W, C), dtype=torch.float32, device=Q.device)
-        for i in range(div):
-            for p in range(div):
-                t = torch.einsum('bijc,bpqc->bijpq', Q[i], K[p])
-                if self.use_rel_pos:
-                    t += torch.einsum('bijc,ipc->bijp', Q[i], Rh[i, p]).view(B, H//div, W, H//div, 1)
-                    t += torch.einsum('bijc,jqc->bijq', Q[i], Rw).view(B, H//div, W, 1, W)
-                t = torch.exp(t)
-                s[:, i*(H//div):(i+1)*(H//div), :] += torch.sum(t, dim=(3, 4))
-                x[:, i*(H//div):(i+1)*(H//div), :, :] += torch.einsum('bijpq,bpqc->bijc', t, V[p])
-        x /= s.view((B, H, W, 1))
-        return x
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
@@ -290,22 +259,38 @@ class Attention(nn.Module):
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
         if self.div == 1:
-            print('no division')
             attn = (q * self.scale) @ k.transpose(-2, -1)
-
             if self.use_rel_pos:
                 attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
-
             attn = attn.softmax(dim=-1)
-        
             x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         else:
+            # attn = (q * self.scale) @ k.transpose(-2, -1)
+            # if self.use_rel_pos:
+            #     attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            # attn = attn.softmax(dim=-1)
+
+            # if self.name == 'attn-block-7':
+            #     torch.save(q, 'q.pt')
+            #     torch.save(k, 'k.pt')
+            #     torch.save(v, 'v.pt')
+            #     torch.save(attn, 'attn.pt')
+            #     torch.save(self.rel_pos_h, 'rel_pos_h.pt')
+            #     torch.save(self.rel_pos_w, 'rel_pos_w.pt')
+
+            # x1 = (attn @ v)
+            # if self.name == 'attn-block-7':
+            #     torch.save(x1, 'x1.pt')
+
+            # x1 = x1.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+
             q = q.view(B * self.num_heads, H, W, -1)
-            k = q.view(B * self.num_heads, H, W, -1)
-            v = q.view(B * self.num_heads, H, W, -1)
-            x = self.blocked_attention(q, k, v, div=self.div)
+            k = k.view(B * self.num_heads, H, W, -1)
+            v = v.view(B * self.num_heads, H, W, -1)
+
+            x = blocked_attention(q, k, v, scale=self.scale, use_rel_pos=self.use_rel_pos, rel_pos_h=self.rel_pos_h, rel_pos_w=self.rel_pos_w, div=self.div)
             x = x.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
-        
+
         x = self.proj(x)
 
         return x
@@ -359,6 +344,46 @@ def window_unpartition(
         x = x[:, :H, :W, :].contiguous()
     return x
 
+def blocked_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, scale=None, div: int =4, use_rel_pos: bool = True, rel_pos_h: torch.Tensor = None, rel_pos_w: torch.Tensor = None):
+        """
+        note: 
+          1. Q and K should be in the same shape
+          2. H and H must be divisable by `div`
+          3. Q, K, V must on the same device
+        """
+        B, H, W, C = Q.shape
+        assert(H//div * div == H and W//div * div == W)
+        if scale is None:
+            scale = C**-0.5
+        if use_rel_pos:
+            Rh = get_rel_pos(H, H, rel_pos_h).view(div, H//div, div, H//div, C).permute(0, 2, 1, 3, 4)
+            Rw = get_rel_pos(W, W, rel_pos_w).view(W, W, C)
+
+        Q = Q.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
+        K = K.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
+        V = V.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
+
+        x = torch.zeros((B, H, W, C), dtype=torch.float32, device=Q.device)
+        for i in range(div):
+            s = torch.zeros((B, H//div, W, div), dtype=torch.float32, device=Q.device)
+            m = torch.zeros((B, H//div, W, div), dtype=torch.float32, device=Q.device)
+            y = torch.zeros((B, H//div, W, C, div), dtype=torch.float32, device=Q.device)
+            for p in range(div):
+                t = torch.einsum('bijc,bpqc->bijpq', Q[i] * scale, K[p])
+                if use_rel_pos:
+                    t += torch.einsum('bijc,ipc->bijp', Q[i], Rh[i, p]).view(B, H//div, W, H//div, 1)
+                    t += torch.einsum('bijc,jqc->bijq', Q[i], Rw).view(B, H//div, W, 1, W)
+                m[:, :, :, p], _ = torch.max(t.view(B, H//div, W, -1), dim=-1)
+                t = torch.exp(t-(m[:, :, :, p]).view(B, H//div, W, 1, 1)).view(B, H//div, W, H//div, W)
+                s[:, :, :, p] = torch.sum(t.view(B, H//div, W, -1), dim=-1)
+                y[:, :, :, :, p] = torch.einsum('bijpq,bpqc->bijc', t, V[p])
+            real_m, _ = torch.max(m, dim=-1)
+            for p in range(div):
+                s[:, :, :, p] *= torch.exp(m[:, :, :, p] - real_m)
+                y[:, :, :, :, p] *= torch.exp(m[:, :, :, p] - real_m).view(B, H//div, W, 1)
+            x[:, i*(H//div):(i+1)*(H//div), :, :] = torch.sum(y, dim=-1) / torch.sum(s, dim=-1).view(B, H//div, W, 1)
+        
+        return x
 
 def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor:
     """

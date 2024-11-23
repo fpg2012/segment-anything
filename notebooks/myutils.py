@@ -213,7 +213,7 @@ def build_sam_with_extrapolation(
             qkv_bias=True,
             use_rel_pos=True,
             global_attn_indexes=encoder_global_attn_indexes,
-            window_size=14,
+            window_size=14*2,
             out_chans=prompt_embed_dim,
             global_attn_div=4,
             window_attn_div=1,
@@ -258,6 +258,11 @@ def build_sam_with_extrapolation(
                      or new_key.endswith('.31.attn.rel_pos_h') or new_key.endswith('.31.attn.rel_pos_w'):
                     param = state_dict[key].unsqueeze(0).unsqueeze(0)
                     param = F.interpolate(param, size=(255, 80), align_corners=True, mode='bilinear')
+                    param = param.squeeze(0).squeeze(0)
+                    filtered_state_dict[new_key] = param
+                elif new_key.endswith('.attn.rel_pos_h') or new_key.endswith('.attn.rel_pos_w'):
+                    param = state_dict[key].unsqueeze(0).unsqueeze(0)
+                    param = F.interpolate(param, size=(55, 80), align_corners=True, mode='bilinear')
                     param = param.squeeze(0).squeeze(0)
                     filtered_state_dict[new_key] = param
                 else:
