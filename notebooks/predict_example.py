@@ -20,8 +20,8 @@ def show_mask(mask, ax, random_color=False):
 def show_points(coords, labels, ax, marker_size=375):
     pos_points = coords[labels==1]
     neg_points = coords[labels==0]
-    ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
-    ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)   
+    ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='.', s=marker_size, edgecolor='white', linewidth=1.25)
+    ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='.', s=marker_size, edgecolor='white', linewidth=1.25)   
     
 def show_box(box, ax):
     x0, y0 = box[0], box[1]
@@ -36,12 +36,14 @@ if __name__ == '__main__':
 
     device = "xpu"
 
-    # sam = sam_model_registry["vit_h"](checkpoint=sam_checkpoint, global_attention_div=4, window_attention_div=1)
+    # sam = sam_model_registry["vit_h"](checkpoint=sam_checkpoint, global_attention_div=1, window_attention_div=1)
     sam = build_sam_with_extrapolation(encoder_embed_dim=1280,
         encoder_depth=32,
         encoder_num_heads=16,
         encoder_global_attn_indexes=[7, 15, 23, 31],
-        checkpoint="../checkpoints/sam_vit_h_4b8939.pth")
+        checkpoint=sam_checkpoint,
+        align_corners=True
+        )
     sam.to(device=device)
     if device == 'xpu':
         sam = ipex.optimize(sam)
@@ -82,4 +84,20 @@ if __name__ == '__main__':
     plt.imshow(image)
     show_mask(masks, plt.gca())
     show_points(input_point, input_label, plt.gca())
-    plt.show() 
+    plt.show()
+
+    input_point = np.array([[600, 500], [450, 100], [900, 100]])
+    input_label = np.array([1, 1, 0])
+    mask_input = logits[0, :, :]
+    masks, scores, logits = predictor.predict(
+        point_coords=input_point,
+        point_labels=input_label,
+        multimask_output=False,
+        mask_input=mask_input[None, :, :],
+    )
+
+    plt.figure(figsize=(5,5))
+    plt.imshow(image)
+    show_mask(masks, plt.gca())
+    show_points(input_point, input_label, plt.gca())
+    plt.show()

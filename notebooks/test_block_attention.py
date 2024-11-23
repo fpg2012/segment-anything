@@ -140,15 +140,11 @@ def my_attention2(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, rel_pos_h, 
     rel_h = torch.einsum("bhwc,hkc->bhwk", q, Rh)
     rel_w = torch.einsum("bhwc,wkc->bhwk", q, Rw)
 
-    attn = attn.view(B, H, W, H, W)
-    attn += rel_h[:, :, :, :, None]
-    attn += rel_w[:, :, :, None, :]
-
-    attn = attn.view(B, H*W, H*W)
+    attn = (attn.view(B, H, W, H, W) + rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]).view(B, H*W, H*W)
 
     attn = torch.softmax(attn, dim=-1)
     x = attn @ V
-    return x
+    return x.view(B, H, W, C)
 
 def real_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, rel_pos_h: torch.Tensor, rel_pos_w: torch.Tensor, scale, H, W):
     attn = (q * scale) @ k.transpose(-2, -1)

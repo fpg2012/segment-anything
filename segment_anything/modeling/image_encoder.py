@@ -265,25 +265,6 @@ class Attention(nn.Module):
             attn = attn.softmax(dim=-1)
             x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         else:
-            # attn = (q * self.scale) @ k.transpose(-2, -1)
-            # if self.use_rel_pos:
-            #     attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
-            # attn = attn.softmax(dim=-1)
-
-            # if self.name == 'attn-block-7':
-            #     torch.save(q, 'q.pt')
-            #     torch.save(k, 'k.pt')
-            #     torch.save(v, 'v.pt')
-            #     torch.save(attn, 'attn.pt')
-            #     torch.save(self.rel_pos_h, 'rel_pos_h.pt')
-            #     torch.save(self.rel_pos_w, 'rel_pos_w.pt')
-
-            # x1 = (attn @ v)
-            # if self.name == 'attn-block-7':
-            #     torch.save(x1, 'x1.pt')
-
-            # x1 = x1.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
-
             q = q.view(B * self.num_heads, H, W, -1)
             k = k.view(B * self.num_heads, H, W, -1)
             v = v.view(B * self.num_heads, H, W, -1)

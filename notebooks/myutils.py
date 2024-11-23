@@ -142,6 +142,7 @@ def build_encoder_only_with_extrapolation(
     encoder_global_attn_indexes,
     image_size=None,
     checkpoint=None,
+    align_corners=True
 ):
     """
     note: windows_size is not enlarged
@@ -174,7 +175,7 @@ def build_encoder_only_with_extrapolation(
                 new_key = key.removeprefix('image_encoder.')
                 if new_key.endswith('pos_embed'):
                     param = state_dict[key].permute(0, 3, 1, 2)
-                    param = F.interpolate(param, size=(128, 128), align_corners=True, mode='bilinear')
+                    param = F.interpolate(param, size=(128, 128), align_corners=align_corners, mode='bilinear')
                     param = param.permute(0, 2, 3, 1)
                     filtered_state_dict[new_key] = param
                 elif new_key.endswith('.7.attn.rel_pos_h') or new_key.endswith('.7.attn.rel_pos_w') \
@@ -182,7 +183,7 @@ def build_encoder_only_with_extrapolation(
                      or new_key.endswith('.23.attn.rel_pos_h') or new_key.endswith('.23.attn.rel_pos_w') \
                      or new_key.endswith('.31.attn.rel_pos_h') or new_key.endswith('.31.attn.rel_pos_w'):
                     param = state_dict[key].unsqueeze(0).unsqueeze(0)
-                    param = F.interpolate(param, size=(255, 80), align_corners=True, mode='bilinear')
+                    param = F.interpolate(param, size=(255, 80), align_corners=align_corners, mode='bilinear')
                     param = param.squeeze(0).squeeze(0)
                     filtered_state_dict[new_key] = param
                 else:
@@ -196,6 +197,7 @@ def build_sam_with_extrapolation(
     encoder_num_heads,
     encoder_global_attn_indexes,
     checkpoint=None,
+    align_corners=True,
 ):
     prompt_embed_dim = 256
     image_size = 2048
@@ -257,12 +259,12 @@ def build_sam_with_extrapolation(
                      or new_key.endswith('.23.attn.rel_pos_h') or new_key.endswith('.23.attn.rel_pos_w') \
                      or new_key.endswith('.31.attn.rel_pos_h') or new_key.endswith('.31.attn.rel_pos_w'):
                     param = state_dict[key].unsqueeze(0).unsqueeze(0)
-                    param = F.interpolate(param, size=(255, 80), align_corners=True, mode='bilinear')
+                    param = F.interpolate(param, size=(255, 80), align_corners=align_corners, mode='bilinear')
                     param = param.squeeze(0).squeeze(0)
                     filtered_state_dict[new_key] = param
                 elif new_key.endswith('.attn.rel_pos_h') or new_key.endswith('.attn.rel_pos_w'):
                     param = state_dict[key].unsqueeze(0).unsqueeze(0)
-                    param = F.interpolate(param, size=(55, 80), align_corners=True, mode='bilinear')
+                    param = F.interpolate(param, size=(55, 80), align_corners=align_corners, mode='bilinear')
                     param = param.squeeze(0).squeeze(0)
                     filtered_state_dict[new_key] = param
                 else:
