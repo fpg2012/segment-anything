@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import Optional, Tuple, Type
+from typing import List, Optional, Tuple, Type
 
 from .common import LayerNorm2d, MLPBlock
 
@@ -58,6 +58,8 @@ class ImageEncoderViT(nn.Module):
         super().__init__()
         self.img_size = img_size
         self.attention_saves = {}
+        self.statistics_saves = {}
+        self.sum_mask = None
 
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),
@@ -73,7 +75,7 @@ class ImageEncoderViT(nn.Module):
                 torch.zeros(1, img_size // patch_size, img_size // patch_size, embed_dim)
             )
 
-        self.blocks = nn.ModuleList()
+        self.blocks: List[Block] = nn.ModuleList()
         for i in range(depth):
             block = Block(
                 dim=embed_dim,
@@ -89,6 +91,7 @@ class ImageEncoderViT(nn.Module):
                 name=f'block-{i}',
                 save=False if not save_attention else (i in global_attn_indexes),
                 attention_saves=self.attention_saves,
+                statistics_save=self.statistics_saves,
                 div=window_attn_div if i not in global_attn_indexes else global_attn_div
             )
             self.blocks.append(block)
@@ -113,6 +116,15 @@ class ImageEncoderViT(nn.Module):
 
     def clear_attention_saves(self):
         self.attention_saves.clear()
+        self.statistics_saves.clear()
+    
+    def init_attention_saves(self):
+        self.statistics_saves['subset_sum'] = {}
+    
+    def set_sum_mask(self, sum_mask: torch.Tensor):
+        self.sum_mask = sum_mask
+        for block in self.blocks:
+            block.set_sum_mask(sum_mask)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x)
@@ -145,6 +157,7 @@ class Block(nn.Module):
         name = None,
         save = False,
         attention_saves = None,
+        statistics_save = None,
         div=1,
     ) -> None:
         """
@@ -177,6 +190,7 @@ class Block(nn.Module):
             name=f'attn-{self.name}',
             save=self.save,
             attention_saves=self.attention_saves,
+            statistics_save=statistics_save,
             div=div,
         )
 
@@ -184,6 +198,9 @@ class Block(nn.Module):
         self.mlp = MLPBlock(embedding_dim=dim, mlp_dim=int(dim * mlp_ratio), act=act_layer)
 
         self.window_size = window_size
+    
+    def set_sum_mask(self, sum_mask: torch.Tensor):
+        self.attn.sum_mask = sum_mask
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x
@@ -218,6 +235,7 @@ class Attention(nn.Module):
         name = None,
         save = False,
         attention_saves = None,
+        statistics_save = None,
         div=1,
     ) -> None:
         """
@@ -242,7 +260,9 @@ class Attention(nn.Module):
         self.name = name
         self.save = save
         self.attention_saves = attention_saves
+        self.statistics_save = statistics_save
         self.div = div
+        self.sum_mask: torch.Tensor = None
         if self.use_rel_pos:
             assert (
                 input_size is not None
@@ -263,13 +283,26 @@ class Attention(nn.Module):
             if self.use_rel_pos:
                 attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
             attn = attn.softmax(dim=-1)
+            attn = (attn + attn @ attn) / 2
             x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+
+            if self.save:
+                patches_on_edge = self.sum_mask.view(1, 1, H*W).expand(self.num_heads, H*W, -1)
+                subset_sum = torch.mean(torch.sum(attn * patches_on_edge, dim=-1), dim=-1)
+                print(subset_sum)
+                self.statistics_save['subset_sum'][self.name] = subset_sum
+
         else:
             q = q.view(B * self.num_heads, H, W, -1)
             k = k.view(B * self.num_heads, H, W, -1)
             v = v.view(B * self.num_heads, H, W, -1)
 
-            x = blocked_attention(q, k, v, scale=self.scale, use_rel_pos=self.use_rel_pos, rel_pos_h=self.rel_pos_h, rel_pos_w=self.rel_pos_w, div=self.div)
+            x = blocked_attention(
+                q, k, v, scale=self.scale, 
+                use_rel_pos=self.use_rel_pos, rel_pos_h=self.rel_pos_h, rel_pos_w=self.rel_pos_w, 
+                div=self.div,
+                save=self.save, statistics_save=self.statistics_save, sum_mask=self.sum_mask, name=self.name,
+                )
             x = x.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
 
         x = self.proj(x)
@@ -325,46 +358,67 @@ def window_unpartition(
         x = x[:, :H, :W, :].contiguous()
     return x
 
-def blocked_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, scale=None, div: int =4, use_rel_pos: bool = True, rel_pos_h: torch.Tensor = None, rel_pos_w: torch.Tensor = None):
-        """
-        note: 
-          1. Q and K should be in the same shape
-          2. H and H must be divisable by `div`
-          3. Q, K, V must on the same device
-        """
-        B, H, W, C = Q.shape
-        assert(H//div * div == H and W//div * div == W)
-        if scale is None:
-            scale = C**-0.5
-        if use_rel_pos:
-            Rh = get_rel_pos(H, H, rel_pos_h).view(div, H//div, div, H//div, C).permute(0, 2, 1, 3, 4)
-            Rw = get_rel_pos(W, W, rel_pos_w).view(W, W, C)
+def blocked_attention(
+    Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, scale=None, div: int =4, 
+    use_rel_pos: bool = True, rel_pos_h: torch.Tensor = None, rel_pos_w: torch.Tensor = None,
+    save: bool = False, statistics_save: dict = None, sum_mask: torch.Tensor = None, name: str = None
+    ):
+    """
+    note: 
+        1. Q and K should be in the same shape
+        2. H and H must be divisable by `div`
+        3. Q, K, V must on the same device
+    """
+    B, H, W, C = Q.shape
+    assert(H//div * div == H and W//div * div == W)
+    if scale is None:
+        scale = C**-0.5
+    if use_rel_pos:
+        Rh = get_rel_pos(H, H, rel_pos_h).view(div, H//div, div, H//div, C).permute(0, 2, 1, 3, 4)
+        Rw = get_rel_pos(W, W, rel_pos_w).view(W, W, C)
 
-        Q = Q.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
-        K = K.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
-        V = V.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
+    Q = Q.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
+    K = K.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
+    V = V.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
+    if save:
+        M = sum_mask.view(1, div, H//div, W).expand(B, -1, -1, -1).permute(1, 0, 2, 3)
 
-        x = torch.zeros((B, H, W, C), dtype=torch.float32, device=Q.device)
-        for i in range(div):
-            s = torch.zeros((B, H//div, W, div), dtype=torch.float32, device=Q.device)
-            m = torch.zeros((B, H//div, W, div), dtype=torch.float32, device=Q.device)
-            y = torch.zeros((B, H//div, W, C, div), dtype=torch.float32, device=Q.device)
-            for p in range(div):
-                t = torch.einsum('bijc,bpqc->bijpq', Q[i] * scale, K[p])
-                if use_rel_pos:
-                    t += torch.einsum('bijc,ipc->bijp', Q[i], Rh[i, p]).view(B, H//div, W, H//div, 1)
-                    t += torch.einsum('bijc,jqc->bijq', Q[i], Rw).view(B, H//div, W, 1, W)
-                m[:, :, :, p], _ = torch.max(t.view(B, H//div, W, -1), dim=-1)
-                t = torch.exp(t-(m[:, :, :, p]).view(B, H//div, W, 1, 1)).view(B, H//div, W, H//div, W)
-                s[:, :, :, p] = torch.sum(t.view(B, H//div, W, -1), dim=-1)
-                y[:, :, :, :, p] = torch.einsum('bijpq,bpqc->bijc', t, V[p])
-            real_m, _ = torch.max(m, dim=-1)
-            for p in range(div):
-                s[:, :, :, p] *= torch.exp(m[:, :, :, p] - real_m)
-                y[:, :, :, :, p] *= torch.exp(m[:, :, :, p] - real_m).view(B, H//div, W, 1)
-            x[:, i*(H//div):(i+1)*(H//div), :, :] = torch.sum(y, dim=-1) / torch.sum(s, dim=-1).view(B, H//div, W, 1)
-        
-        return x
+    x = torch.zeros((B, H, W, C), dtype=torch.float32, device=Q.device)
+    if save:
+        subset_sum = torch.zeros((B, H, W), dtype=torch.float32, device=Q.device)
+    for i in range(div):
+        s = torch.zeros((B, H//div, W, div), dtype=torch.float32, device=Q.device)
+        m = torch.zeros((B, H//div, W, div), dtype=torch.float32, device=Q.device)
+        y = torch.zeros((B, H//div, W, C, div), dtype=torch.float32, device=Q.device)
+        if save:
+            z = torch.zeros((B, H//div, W, div), dtype=torch.float32, device=Q.device)
+        for p in range(div):
+            t = torch.einsum('bijc,bpqc->bijpq', Q[i] * scale, K[p])
+            if use_rel_pos:
+                t += torch.einsum('bijc,ipc->bijp', Q[i], Rh[i, p]).view(B, H//div, W, H//div, 1)
+                t += torch.einsum('bijc,jqc->bijq', Q[i], Rw).view(B, H//div, W, 1, W)
+            m[:, :, :, p], _ = torch.max(t.view(B, H//div, W, -1), dim=-1)
+            t = torch.exp(t-(m[:, :, :, p]).view(B, H//div, W, 1, 1)).view(B, H//div, W, H//div, W)
+            s[:, :, :, p] = torch.sum(t.view(B, H//div, W, -1), dim=-1)
+            y[:, :, :, :, p] = torch.einsum('bijpq,bpqc->bijc', t, V[p])
+            if save:
+                z[:, :, :, p] = torch.einsum('bijpq,bpq->bij', t, M[p])
+        real_m, _ = torch.max(m, dim=-1)
+        for p in range(div):
+            s[:, :, :, p] *= torch.exp(m[:, :, :, p] - real_m)
+            y[:, :, :, :, p] *= torch.exp(m[:, :, :, p] - real_m).view(B, H//div, W, 1)
+            if save:
+                z[:, :, :, p] *= torch.exp(m[:, :, :, p] - real_m).view(B, H//div, W)
+        x[:, i*(H//div):(i+1)*(H//div), :, :] = torch.sum(y, dim=-1) / torch.sum(s, dim=-1).view(B, H//div, W, 1)
+        if save:
+            subset_sum[:, i*(H//div):(i+1)*(H//div), :] = torch.sum(z, dim=-1) / torch.sum(s, dim=-1)
+
+    if save:
+        subset_sum = torch.mean(subset_sum, dim=(1, 2))
+        print(subset_sum)
+        statistics_save['subset_sum'][name] = subset_sum
+
+    return x
 
 def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor:
     """

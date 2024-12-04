@@ -85,7 +85,7 @@ class SamPredictor:
 
         self.original_size = original_image_size
         self.input_size = tuple(transformed_image.shape[-2:])
-        print('input_tensor_size: ', transformed_image.shape)
+        # print('input_tensor_size: ', transformed_image.shape)
         input_image = self.model.preprocess(transformed_image)
         self.features = self.model.image_encoder(input_image)
         self.is_image_set = True

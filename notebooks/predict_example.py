@@ -86,8 +86,8 @@ if __name__ == '__main__':
     show_points(input_point, input_label, plt.gca())
     plt.show()
 
-    input_point = np.array([[600, 500], [450, 100], [900, 100]])
-    input_label = np.array([1, 1, 0])
+    input_point = np.array([[600, 500], [450, 100], [900, 100], [200, 400]])
+    input_label = np.array([1, 1, 0, 0])
     mask_input = logits[0, :, :]
     masks, scores, logits = predictor.predict(
         point_coords=input_point,

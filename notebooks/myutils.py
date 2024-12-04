@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 import cv2
 import numpy as np
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 import os
 from segment_anything.modeling import ImageEncoderViT
 from functools import partial
@@ -14,55 +13,6 @@ from segment_anything.modeling.mask_decoder import MaskDecoder
 from segment_anything.modeling.prompt_encoder import PromptEncoder
 from segment_anything.modeling.sam import Sam
 from segment_anything.modeling.transformer import TwoWayTransformer
-
-class COCOMValDataset(Dataset):
-    
-    def __init__(self, dataset_dir, transform, image_size=1024, num_images=100):
-        self.dataset_dir = dataset_dir
-        self.num_images = num_images
-        self.image_size = image_size
-        self.image_name_list = self.load_images_list(self.num_images)
-        self.transform = transform
-        self.pixel_mean = torch.tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
-        self.pixel_std = torch.tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
-    
-    def load_images_list(self, num_images: int):
-        files = os.listdir(self.dataset_dir)
-        images = []
-        cnt = 0
-        for fn in files:
-            filename = os.fsdecode(fn)
-            if cnt >= num_images:
-                break
-            if filename.endswith('.jpg'):
-                images.append(self.dataset_dir + filename)
-                cnt += 1
-        return images
-
-    def __len__(self):
-        return self.num_images
-
-    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize pixel values and pad to a square input."""
-        # Normalize colors
-        x = (x - self.pixel_mean) / self.pixel_std
-
-        # Pad
-        h, w = x.shape[-2:]
-        padh = self.image_size - h
-        padw = self.image_size - w
-        x = F.pad(x, (0, padw, 0, padh))
-        return x
-
-    def __getitem__(self, index):
-        image_path = self.image_name_list[index]
-        image = cv2.imread(image_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        input_image = self.transform.apply_image(image)
-        input_image_torch = torch.as_tensor(input_image)
-        input_image_torch = input_image_torch.permute(2, 0, 1)
-        input_image_torch = self.preprocess(input_image_torch)
-        return input_image_torch, index
 
 class Visualizer:
     def __init__(self, save_dir):
@@ -105,6 +55,9 @@ def build_encoder_only(
     encoder_global_attn_indexes,
     image_size=None,
     checkpoint=None,
+    save=False,
+    global_attn_div: int = 1,
+    window_attn_div: int = 1,
 ):
     prompt_embed_dim = 256
     image_size = 1024 if image_size is None else image_size
@@ -123,6 +76,9 @@ def build_encoder_only(
             global_attn_indexes=encoder_global_attn_indexes,
             window_size=14,
             out_chans=prompt_embed_dim,
+            save_attention=save,
+            global_attn_div=global_attn_div,
+            window_attn_div=window_attn_div,
         )
     image_encoder.eval()
     if checkpoint is not None:
@@ -140,31 +96,31 @@ def build_encoder_only_with_extrapolation(
     encoder_depth,
     encoder_num_heads,
     encoder_global_attn_indexes,
-    image_size=None,
     checkpoint=None,
-    align_corners=True
+    align_corners=True,
+    save: bool=False
 ):
-    """
-    note: windows_size is not enlarged
-    """
     prompt_embed_dim = 256
-    image_size = 1024 if image_size is None else image_size
+    image_size = 2048
     vit_patch_size = 16
     image_embedding_size = image_size // vit_patch_size
     image_encoder=ImageEncoderViT(
-            depth=encoder_depth,
-            embed_dim=encoder_embed_dim,
-            img_size=image_size,
-            mlp_ratio=4,
-            norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
-            num_heads=encoder_num_heads,
-            patch_size=vit_patch_size,
-            qkv_bias=True,
-            use_rel_pos=True,
-            global_attn_indexes=encoder_global_attn_indexes,
-            window_size=14,
-            out_chans=prompt_embed_dim,
-        )
+        depth=encoder_depth,
+        embed_dim=encoder_embed_dim,
+        img_size=image_size,
+        mlp_ratio=4,
+        norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+        num_heads=encoder_num_heads,
+        patch_size=vit_patch_size,
+        qkv_bias=True,
+        use_rel_pos=True,
+        global_attn_indexes=encoder_global_attn_indexes,
+        window_size=14*2,
+        out_chans=prompt_embed_dim,
+        global_attn_div=4,
+        window_attn_div=1,
+        save_attention=save,
+    )
     image_encoder.eval()
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:
@@ -172,13 +128,13 @@ def build_encoder_only_with_extrapolation(
         filtered_state_dict = {}
         for key in state_dict.keys():
             if key.startswith('image_encoder.'):
-                new_key = key.removeprefix('image_encoder.')
-                if new_key.endswith('pos_embed'):
+                new_key = str.removeprefix(key, 'image_encoder.')
+                if key.endswith('pos_embed'):
                     param = state_dict[key].permute(0, 3, 1, 2)
-                    param = F.interpolate(param, size=(128, 128), align_corners=align_corners, mode='bilinear')
+                    param = F.interpolate(param, size=(128, 128), align_corners=True, mode='bilinear')
                     param = param.permute(0, 2, 3, 1)
                     filtered_state_dict[new_key] = param
-                elif new_key.endswith('.7.attn.rel_pos_h') or new_key.endswith('.7.attn.rel_pos_w') \
+                elif key.endswith('.7.attn.rel_pos_h') or new_key.endswith('.7.attn.rel_pos_w') \
                      or new_key.endswith('.15.attn.rel_pos_h') or new_key.endswith('.15.attn.rel_pos_w') \
                      or new_key.endswith('.23.attn.rel_pos_h') or new_key.endswith('.23.attn.rel_pos_w') \
                      or new_key.endswith('.31.attn.rel_pos_h') or new_key.endswith('.31.attn.rel_pos_w'):
@@ -186,9 +142,17 @@ def build_encoder_only_with_extrapolation(
                     param = F.interpolate(param, size=(255, 80), align_corners=align_corners, mode='bilinear')
                     param = param.squeeze(0).squeeze(0)
                     filtered_state_dict[new_key] = param
+                elif key.endswith('.attn.rel_pos_h') or new_key.endswith('.attn.rel_pos_w'):
+                    param = state_dict[key].unsqueeze(0).unsqueeze(0)
+                    param = F.interpolate(param, size=(55, 80), align_corners=align_corners, mode='bilinear')
+                    param = param.squeeze(0).squeeze(0)
+                    filtered_state_dict[new_key] = param
                 else:
                     filtered_state_dict[new_key] = state_dict[key]
+            # else:
+            #     filtered_state_dict[key] = state_dict[key]
         image_encoder.load_state_dict(filtered_state_dict)
+        #sam = ipex.optimize_transformers(sam)
     return image_encoder
 
 def build_sam_with_extrapolation(

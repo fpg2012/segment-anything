@@ -15,27 +15,28 @@ EV_CFG = {
     "model_type": "vit_h",
     "device": "xpu",
     "dataset_path": '../datasets/COCO_MVal/img/',
-    "batch_size": 2,
+    "batch_size": 1,
     "num_images": 100,
     'attn_dir': './attention/',
     "topk": 100,
-    "save_batch_size": 4,
     "border_overlap_save_dir": './border_overlap/',
     "canny_low_thresh": 45,
     "canny_high_thresh": 145,
     "gaussian_kernel_size": 5,
+    "image_size": 2048,
 }
 
 class Evaluator:
     
     def __init__(self, encoder: ImageEncoderViT, dataset: Dataset, batch_size: int = 2, save_dir='./', 
                  topk=100, border_overlap_save_dir='./', canny_low_thresh=50, canny_high_thresh=150, gaussian_kernel_size=5,
-                 device='cpu', **params):
+                 device='cpu', image_size=1024, **params):
         self.encoder: ImageEncoderViT = encoder
         self.dataloader: DataLoader = DataLoader(dataset, batch_size, shuffle=False)
         self.device = device
         self.batch_size: int = batch_size
         self.save_dir = save_dir
+        self.image_size = image_size
 
         self.canny_low_thresh = canny_low_thresh
         self.canny_high_thresh = canny_high_thresh
@@ -51,23 +52,32 @@ class Evaluator:
 
     def evaluate_with_images(self):
         cnt = 0
+        to_tensor = ToTensor()
         with torch.no_grad():
             for (X, ind) in self.dataloader:
                 print(f'batch {ind}')
                 self.encoder.clear_attention_saves()
+                self.encoder.init_attention_saves()
                 torch.xpu.empty_cache()
                 # for i in range(self.batch_size):
                 #     self.show_image_and_edge(X[i])
                 
                 X = X.to(self.device)
+                _, edge = self.get_edge(X[0])
+                edge_tensor = to_tensor(edge).to(self.device)
+                patches_on_edge = self.patch_on_edge(edge_tensor).view(1, self.image_size // 16, self.image_size // 16)
+                self.encoder.set_sum_mask(patches_on_edge)
+
                 self.encoder(X)
-                attention_saves = self.encoder.attention_saves
-                self.save_attention(attention_saves)
-                self.calc_edge_overlap(X)
-                self.attention_saves.clear()
-            self._save_stats(self.overlap_size, 'overlap')
+                
+                sts = self.encoder.statistics_saves['subset_sum']
+                for key, value in sts.items():
+                    if key not in self.border_attention_sum.keys():
+                        self.border_attention_sum[key] = sts[key]
+                    else:
+                        self.border_attention_sum[key] += sts[key]
+
             self._save_stats(self.border_attention_sum, 'border_attention_sum')
-            self._save_stats(self.overlap_attention_sum, 'overlap_attenntion_sum')
     
     def _save_stats(self, st: dict, name):
         for key, result in st.items():
@@ -82,7 +92,7 @@ class Evaluator:
             plt.grid(True)
             plt.savefig(self.border_overlap_save_dir + f'{name}-{key}.svg')
             plt.clf()
-    
+
     def calc_edge_overlap(self, images: torch.Tensor):
         to_tensor = ToTensor()
         k = self.topk
@@ -121,13 +131,6 @@ class Evaluator:
                     self.overlap_attention_sum[key] = overlap_attention_sum
                 else:
                     self.overlap_attention_sum[key] += overlap_attention_sum
-        
-    def save_attention(self, attention_saves):
-        for key, attn in attention_saves.items():
-            if key not in self.attention_saves:
-                self.attention_saves[key] = attn.view(2, 16, 4096, 4096)
-            else:
-                self.attention_saves[key] = torch.cat([self.attention_saves[key], attn.view(2, 16, 4096, 4096)])
 
     def save_pickle(self, ind):
         print(f'... saving {ind}')
@@ -172,18 +175,19 @@ class Evaluator:
         return result
 
 if __name__ == '__main__':
-    sam_encoder = build_encoder_only(
+    sam_encoder = build_encoder_only_with_extrapolation(
         encoder_embed_dim=1280,
         encoder_depth=32,
         encoder_num_heads=16,
         encoder_global_attn_indexes=[7, 15, 23, 31],
         checkpoint=EV_CFG['sam_checkpoint'],
+        save=True,
     )
     sam_encoder.to(device=EV_CFG['device'])
 
     gc.collect()
     
-    image_size = 1024
+    image_size = EV_CFG["image_size"]
     batch_size = EV_CFG['batch_size']
 
     dataset = COCOMValDataset(EV_CFG['dataset_path'], ResizeLongestSide(image_size), image_size=image_size, num_images=EV_CFG["num_images"])
