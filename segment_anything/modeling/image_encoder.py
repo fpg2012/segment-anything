@@ -283,7 +283,6 @@ class Attention(nn.Module):
             if self.use_rel_pos:
                 attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
             attn = attn.softmax(dim=-1)
-            attn = (attn + attn @ attn) / 2
             x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
 
             if self.save:

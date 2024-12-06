@@ -3,7 +3,6 @@ import matplotlib.pyplot as plt
 import cv2
 import numpy as np
 import torch.nn.functional as F
-import os
 from segment_anything.modeling import ImageEncoderViT
 from functools import partial
 import gc
@@ -46,6 +45,28 @@ class Visualizer:
                 cv2.rectangle(image_cv, (rj * patch_size + i * im_size, ri * patch_size + j * im_size), (rj * patch_size + i * im_size + patch_size, ri * patch_size + j * im_size + patch_size), (0, 255, 0), 1)
         image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)
         cv2.imwrite(self.save_dir + name + '.jpg', image_cv)
+
+def show_mask(mask, ax, random_color=False, gt=False):
+    if random_color:
+        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+    elif gt:
+        color = np.array([255/255, 10/255, 10/255, 0.6])
+    else:
+        color = np.array([30/255, 144/255, 255/255, 0.6])
+    h, w = mask.shape[-2:]
+    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+    ax.imshow(mask_image)
+    
+def show_points(coords, labels, ax, marker_size=375):
+    pos_points = coords[labels==1]
+    neg_points = coords[labels==0]
+    ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='.', s=marker_size, edgecolor='white', linewidth=1.25)
+    ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='.', s=marker_size, edgecolor='white', linewidth=1.25)   
+    
+def show_box(box, ax):
+    x0, y0 = box[0], box[1]
+    w, h = box[2] - box[0], box[3] - box[1]
+    ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0,0,0,0), lw=2))
 
 def build_encoder_only(
     encoder_embed_dim,
