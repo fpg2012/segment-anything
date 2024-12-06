@@ -1,19 +1,23 @@
 import torch
-import intel_extension_for_pytorch as ipex
 import gc
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
-import torch.functional as F
+import torch.nn.functional as F
 from torchvision.transforms import ToTensor
+from torch.utils.data import DataLoader, Dataset
 
 from segment_anything.utils.transforms import ResizeLongestSide
-from myutils import *
+import sys
+sys.path.append("..")
+from utils.misc import ImageEncoderViT, build_encoder_only_with_extrapolation, build_encoder_only
+from utils.dataset import COCOMValDataset
 
+sys.path.append("notebooks")
 EV_CFG = {
     "sam_checkpoint": "../checkpoints/sam_vit_h_4b8939.pth",
     "model_type": "vit_h",
-    "device": "xpu",
+    "device": "cuda:3",
     "dataset_path": '../datasets/COCO_MVal/img/',
     "batch_size": 1,
     "num_images": 100,
@@ -23,7 +27,7 @@ EV_CFG = {
     "canny_low_thresh": 45,
     "canny_high_thresh": 145,
     "gaussian_kernel_size": 5,
-    "image_size": 2048,
+    "image_size": 1024,
 }
 
 class Evaluator:
@@ -175,7 +179,7 @@ class Evaluator:
         return result
 
 if __name__ == '__main__':
-    sam_encoder = build_encoder_only_with_extrapolation(
+    sam_encoder = build_encoder_only(
         encoder_embed_dim=1280,
         encoder_depth=32,
         encoder_num_heads=16,
@@ -184,8 +188,6 @@ if __name__ == '__main__':
         save=True,
     )
     sam_encoder.to(device=EV_CFG['device'])
-
-    gc.collect()
     
     image_size = EV_CFG["image_size"]
     batch_size = EV_CFG['batch_size']

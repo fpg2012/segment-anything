@@ -1,12 +1,11 @@
 import numpy as np
 import torch
-import intel_extension_for_pytorch as ipex
 import matplotlib.pyplot as plt
 import cv2
 import sys
 sys.path.append("..")
 from segment_anything import sam_model_registry, SamPredictor
-from myutils import build_sam_with_extrapolation
+from utils import build_sam_with_extrapolation
 
 def show_mask(mask, ax, random_color=False):
     if random_color:
@@ -34,7 +33,9 @@ if __name__ == '__main__':
     sam_checkpoint = "../checkpoints/sam_vit_h_4b8939.pth"
     model_type = "vit_h"
 
-    device = "xpu"
+    device = "cuda"
+    if device == 'xpu':
+        import intel_extension_for_pytorch as ipex
 
     # sam = sam_model_registry["vit_h"](checkpoint=sam_checkpoint, global_attention_div=1, window_attention_div=1)
     sam = build_sam_with_extrapolation(encoder_embed_dim=1280,
