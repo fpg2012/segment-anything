@@ -6,18 +6,20 @@
 
 import numpy as np
 import torch
+from torchvision.transforms import ToTensor
 
 from segment_anything.modeling import Sam
 
 from typing import Optional, Tuple
 
 from .utils.transforms import ResizeLongestSide
-
+from .utils.canny import get_edge, get_patches_on_edge
 
 class SamPredictor:
     def __init__(
         self,
         sam_model: Sam,
+        use_canny_bias: bool = False
     ) -> None:
         """
         Uses SAM to calculate the image embedding for an image, and then
@@ -29,6 +31,7 @@ class SamPredictor:
         super().__init__()
         self.model = sam_model
         self.transform = ResizeLongestSide(sam_model.image_encoder.img_size)
+        self.use_canny_bias: bool = use_canny_bias,
         self.reset_image()
 
     def set_image(
@@ -82,11 +85,19 @@ class SamPredictor:
             and max(*transformed_image.shape[2:]) == self.model.image_encoder.img_size
         ), f"set_torch_image input must be BCHW with long side {self.model.image_encoder.img_size}."
         self.reset_image()
+        to_tensor = ToTensor()
 
         self.original_size = original_image_size
         self.input_size = tuple(transformed_image.shape[-2:])
         # print('input_tensor_size: ', transformed_image.shape)
         input_image = self.model.preprocess(transformed_image)
+
+        if self.use_canny_bias:
+            _, edge = get_edge(input_image[0])
+            edge_tensor = to_tensor(edge).to(self.device)
+            img_size = self.model.image_encoder.img_size
+            patches_on_edge = get_patches_on_edge(edge_tensor).view(1, img_size//16, img_size//16)
+            self.model.image_encoder.set_canny_mask(patches_on_edge)
         self.features = self.model.image_encoder(input_image)
         self.is_image_set = True
 

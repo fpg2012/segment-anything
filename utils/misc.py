@@ -68,6 +68,23 @@ def show_box(box, ax):
     w, h = box[2] - box[0], box[3] - box[1]
     ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0,0,0,0), lw=2))
 
+def get_edge(image: torch.Tensor, gaussian_kernel_size: int = 5, canny_low_thresh: int = 50, canny_high_thresh: int = 150) -> tuple[np.ndarray, np.ndarray]:
+    """
+    returns gray_image and edges
+    """
+    color_image = image.permute(1, 2, 0).cpu().numpy()
+    color_image = cv2.normalize(color_image, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+    color_image = (color_image * 255).astype(np.uint8)
+    color_image = cv2.GaussianBlur(color_image, (gaussian_kernel_size, gaussian_kernel_size), 0)
+    gray_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2GRAY)
+    low_threshold = canny_low_thresh
+    high_threshold = canny_high_thresh
+    edges = cv2.Canny(gray_image, low_threshold, high_threshold)
+    return gray_image, edges
+
+def get_patches_on_edge(edge: torch.Tensor) -> torch.Tensor:
+    return F.max_pool2d(edge, 16, 16)
+
 def build_encoder_only(
     encoder_embed_dim,
     encoder_depth,
@@ -78,6 +95,8 @@ def build_encoder_only(
     save=False,
     global_attn_div: int = 1,
     window_attn_div: int = 1,
+    use_canny_bias: bool = False,
+    canny_bias: float = 8/3,
 ):
     prompt_embed_dim = 256
     image_size = 1024 if image_size is None else image_size
@@ -99,6 +118,8 @@ def build_encoder_only(
             save_attention=save,
             global_attn_div=global_attn_div,
             window_attn_div=window_attn_div,
+            use_canny_bias=use_canny_bias,
+            canny_bias=canny_bias,
         )
     image_encoder.eval()
     if checkpoint is not None:
@@ -118,7 +139,9 @@ def build_encoder_only_with_extrapolation(
     encoder_global_attn_indexes,
     checkpoint=None,
     align_corners=True,
-    save: bool=False
+    save: bool=False,
+    use_canny_bias: bool = False,
+    canny_bias: float = 8/3,
 ):
     prompt_embed_dim = 256
     image_size = 2048
@@ -140,6 +163,8 @@ def build_encoder_only_with_extrapolation(
         global_attn_div=4,
         window_attn_div=1,
         save_attention=save,
+        use_canny_bias=use_canny_bias,
+        canny_bias=canny_bias,
     )
     image_encoder.eval()
     if checkpoint is not None:
@@ -182,6 +207,8 @@ def build_sam_with_extrapolation(
     encoder_global_attn_indexes,
     checkpoint=None,
     align_corners=True,
+    use_canny_bias: bool = False,
+    canny_bias: float = 8/3,
 ):
     prompt_embed_dim = 256
     image_size = 2048
@@ -203,6 +230,8 @@ def build_sam_with_extrapolation(
             out_chans=prompt_embed_dim,
             global_attn_div=4,
             window_attn_div=1,
+            use_canny_bias=use_canny_bias,
+            canny_bias=canny_bias,
         ),
         prompt_encoder=PromptEncoder(
             embed_dim=prompt_embed_dim,

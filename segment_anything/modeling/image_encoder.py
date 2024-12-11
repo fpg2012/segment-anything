@@ -36,6 +36,9 @@ class ImageEncoderViT(nn.Module):
         save_attention: bool = False,
         global_attn_div: int = 1,
         window_attn_div: int = 1,
+        use_canny_bias: bool = False,
+        canny_bias = 0,
+        canny_scale = 1,
     ) -> None:
         """
         Args:
@@ -59,7 +62,7 @@ class ImageEncoderViT(nn.Module):
         self.img_size = img_size
         self.attention_saves = {}
         self.statistics_saves = {}
-        self.sum_mask = None
+        self.canny_mask = None
 
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),
@@ -92,7 +95,10 @@ class ImageEncoderViT(nn.Module):
                 save=False if not save_attention else (i in global_attn_indexes),
                 attention_saves=self.attention_saves,
                 statistics_save=self.statistics_saves,
-                div=window_attn_div if i not in global_attn_indexes else global_attn_div
+                div=window_attn_div if i not in global_attn_indexes else global_attn_div,
+                use_canny_bias=False if not use_canny_bias else (i in global_attn_indexes),
+                canny_bias=canny_bias,
+                canny_scale=canny_scale,
             )
             self.blocks.append(block)
 
@@ -121,10 +127,10 @@ class ImageEncoderViT(nn.Module):
     def init_attention_saves(self):
         self.statistics_saves['subset_sum'] = {}
     
-    def set_sum_mask(self, sum_mask: torch.Tensor):
-        self.sum_mask = sum_mask
+    def set_canny_mask(self, canny_mask: torch.Tensor):
+        self.canny_mask = canny_mask
         for block in self.blocks:
-            block.set_sum_mask(sum_mask)
+            block.set_canny_mask(canny_mask)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x)
@@ -159,6 +165,9 @@ class Block(nn.Module):
         attention_saves = None,
         statistics_save = None,
         div=1,
+        use_canny_bias = False,
+        canny_bias=0,
+        canny_scale=1,
     ) -> None:
         """
         Args:
@@ -192,6 +201,9 @@ class Block(nn.Module):
             attention_saves=self.attention_saves,
             statistics_save=statistics_save,
             div=div,
+            use_canny_bias=use_canny_bias,
+            canny_bias=canny_bias,
+            canny_scale=canny_scale,
         )
 
         self.norm2 = norm_layer(dim)
@@ -199,8 +211,8 @@ class Block(nn.Module):
 
         self.window_size = window_size
     
-    def set_sum_mask(self, sum_mask: torch.Tensor):
-        self.attn.sum_mask = sum_mask
+    def set_canny_mask(self, canny_mask: torch.Tensor):
+        self.attn.canny_mask = canny_mask
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x
@@ -237,6 +249,9 @@ class Attention(nn.Module):
         attention_saves = None,
         statistics_save = None,
         div=1,
+        use_canny_bias = False,
+        canny_bias = 0,
+        canny_scale = 1,
     ) -> None:
         """
         Args:
@@ -262,7 +277,9 @@ class Attention(nn.Module):
         self.attention_saves = attention_saves
         self.statistics_save = statistics_save
         self.div = div
-        self.sum_mask: torch.Tensor = None
+        self.canny_mask: torch.Tensor = None
+        self.canny_bias = canny_bias
+        self.canny_scale = canny_scale
         if self.use_rel_pos:
             assert (
                 input_size is not None
@@ -270,6 +287,8 @@ class Attention(nn.Module):
             # initialize relative positional embeddings
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
+        
+        self.use_canny_bias = use_canny_bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, _ = x.shape
@@ -282,11 +301,15 @@ class Attention(nn.Module):
             attn = (q * self.scale) @ k.transpose(-2, -1)
             if self.use_rel_pos:
                 attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            if self.use_canny_bias:
+                patches_on_edge = self.canny_mask.view(1, 1, H*W).expand(self.num_heads) > 0.9
+                attn[patches_on_edge] *= self.canny_scale
+                attn[patches_on_edge] += self.canny_bias
             attn = attn.softmax(dim=-1)
             x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
-
+            
             if self.save:
-                patches_on_edge = self.sum_mask.view(1, 1, H*W).expand(self.num_heads, H*W, -1)
+                patches_on_edge = self.canny_mask.view(1, 1, H*W).expand(self.num_heads, H*W, -1)
                 subset_sum = torch.mean(torch.sum(attn * patches_on_edge, dim=-1), dim=-1)
                 print(subset_sum)
                 self.statistics_save['subset_sum'][self.name] = subset_sum
@@ -300,7 +323,8 @@ class Attention(nn.Module):
                 q, k, v, scale=self.scale, 
                 use_rel_pos=self.use_rel_pos, rel_pos_h=self.rel_pos_h, rel_pos_w=self.rel_pos_w, 
                 div=self.div,
-                save=self.save, statistics_save=self.statistics_save, sum_mask=self.sum_mask, name=self.name,
+                save=self.save, statistics_save=self.statistics_save, canny_mask=self.canny_mask, name=self.name,
+                use_canny_bias=self.use_canny_bias, canny_bias=self.canny_bias, canny_scale=self.canny_scale,
                 )
             x = x.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
 
@@ -360,9 +384,11 @@ def window_unpartition(
 def blocked_attention(
     Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, scale=None, div: int =4, 
     use_rel_pos: bool = True, rel_pos_h: torch.Tensor = None, rel_pos_w: torch.Tensor = None,
-    save: bool = False, statistics_save: dict = None, sum_mask: torch.Tensor = None, name: str = None
+    save: bool = False, statistics_save: dict = None, canny_mask: torch.Tensor = None, name: str = None,
+    use_canny_bias = False, canny_bias: float = 0, canny_scale: float = 1.0,
     ):
     """
+    TODO `canny_scale` not implemented !!!!
     note: 
         1. Q and K should be in the same shape
         2. H and H must be divisable by `div`
@@ -379,8 +405,8 @@ def blocked_attention(
     Q = Q.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
     K = K.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
     V = V.view(B, div, H//div, W, C).permute(1, 0, 2, 3, 4)
-    if save:
-        M = sum_mask.view(1, div, H//div, W).expand(B, -1, -1, -1).permute(1, 0, 2, 3)
+    if save or use_canny_bias:
+        M = canny_mask.view(1, div, H//div, W).expand(B, -1, -1, -1).permute(1, 0, 2, 3)
 
     x = torch.zeros((B, H, W, C), dtype=torch.float32, device=Q.device)
     if save:
@@ -393,6 +419,8 @@ def blocked_attention(
             z = torch.zeros((B, H//div, W, div), dtype=torch.float32, device=Q.device)
         for p in range(div):
             t = torch.einsum('bijc,bpqc->bijpq', Q[i] * scale, K[p])
+            if use_canny_bias:
+                t += M[p].view(B, 1, 1, H//div, W) * canny_bias
             if use_rel_pos:
                 t += torch.einsum('bijc,ipc->bijp', Q[i], Rh[i, p]).view(B, H//div, W, H//div, 1)
                 t += torch.einsum('bijc,jqc->bijq', Q[i], Rw).view(B, H//div, W, 1, W)
@@ -450,7 +478,6 @@ def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor
     relative_coords = (q_coords - k_coords) + (k_size - 1) * max(q_size / k_size, 1.0)
 
     return rel_pos_resized[relative_coords.long()]
-
 
 def add_decomposed_rel_pos(
     attn: torch.Tensor,

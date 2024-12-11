@@ -4,7 +4,7 @@ from segment_anything import sam_model_registry, SamPredictor
 import sys
 sys.path.append("..")
 from utils.dataset import MyDataset, DAVISDataset
-from utils.misc import show_mask, show_points, build_sam_with_extrapolation
+from utils.misc import show_mask, show_points, build_sam_with_extrapolation, get_edge, get_patches_on_edge
 import matplotlib.pyplot as plt
 import argparse
 
@@ -102,11 +102,14 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='vit_h')
     parser.add_argument('--result_file', type=str, default='result.svg')
     parser.add_argument('--enable_extrapolation', type=bool, default=False)
+    parser.add_argument('--enable_bias', type=bool, default=False)
+    parser.add_argument('--canny_bias', type=float, default=np.log(8/3))
     args = parser.parse_args()
 
     model = args.model
     device = args.device
     checkpoint = args.checkpoint
+    use_canny_bias = args.enable_bias
 
     enable_extrapolation: bool = args.enable_extrapolation
 
@@ -119,7 +122,9 @@ if __name__ == '__main__':
             encoder_num_heads=16,
             encoder_global_attn_indexes=[7, 15, 23, 31],
             checkpoint=checkpoint,
-            align_corners=True
+            align_corners=True,
+            use_canny_bias=use_canny_bias,
+            canny_bias=np.log(8/3),
         )
         dataset = DAVISDataset('../datasets/DAVIS/')
 

@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from torchvision.transforms import ToTensor
 from torch.utils.data import DataLoader, Dataset
+import math
 
 from segment_anything.utils.transforms import ResizeLongestSide
 import sys
@@ -27,7 +28,8 @@ EV_CFG = {
     "canny_low_thresh": 45,
     "canny_high_thresh": 145,
     "gaussian_kernel_size": 5,
-    "image_size": 1024,
+    "extrapolation": 2,
+    "canny_bias": math.log(8/3),
 }
 
 class Evaluator:
@@ -70,7 +72,7 @@ class Evaluator:
                 _, edge = self.get_edge(X[0])
                 edge_tensor = to_tensor(edge).to(self.device)
                 patches_on_edge = self.patch_on_edge(edge_tensor).view(1, self.image_size // 16, self.image_size // 16)
-                self.encoder.set_sum_mask(patches_on_edge)
+                self.encoder.set_canny_mask(patches_on_edge)
 
                 self.encoder(X)
                 
@@ -179,20 +181,36 @@ class Evaluator:
         return result
 
 if __name__ == '__main__':
-    sam_encoder = build_encoder_only(
-        encoder_embed_dim=1280,
-        encoder_depth=32,
-        encoder_num_heads=16,
-        encoder_global_attn_indexes=[7, 15, 23, 31],
-        checkpoint=EV_CFG['sam_checkpoint'],
-        save=True,
-    )
-    sam_encoder.to(device=EV_CFG['device'])
-    
-    image_size = EV_CFG["image_size"]
+    image_size = 1024
+    if EV_CFG["extrapolation"] > 1:
+        image_size = 2048
     batch_size = EV_CFG['batch_size']
+    use_canny_bias = (EV_CFG['canny_bias'] > 0)
+    canny_bias = EV_CFG['canny_bias']
+
+    if EV_CFG['extrapolation'] == 1:
+        sam_encoder = build_encoder_only(
+            encoder_embed_dim=1280,
+            encoder_depth=32,
+            encoder_num_heads=16,
+            encoder_global_attn_indexes=[7, 15, 23, 31],
+            checkpoint=EV_CFG['sam_checkpoint'],
+            save=True,
+        )
+    elif EV_CFG['extrapolation'] > 1:
+        sam_encoder = build_encoder_only_with_extrapolation(
+            encoder_embed_dim=1280,
+            encoder_depth=32,
+            encoder_num_heads=16,
+            encoder_global_attn_indexes=[7, 15, 23, 31],
+            checkpoint=EV_CFG['sam_checkpoint'],
+            save=True,
+            use_canny_bias=use_canny_bias,
+            canny_bias=canny_bias,
+        )
+    sam_encoder.to(device=EV_CFG['device'])
 
     dataset = COCOMValDataset(EV_CFG['dataset_path'], ResizeLongestSide(image_size), image_size=image_size, num_images=EV_CFG["num_images"])
 
-    evaluator = Evaluator(sam_encoder, dataset, **EV_CFG)
+    evaluator = Evaluator(sam_encoder, dataset, image_size=image_size, **EV_CFG)
     evaluator.evaluate_with_images()
